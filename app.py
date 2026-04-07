@@ -200,12 +200,12 @@ def rag_pipeline(query: str, history: List[Dict] = None) -> str:
     messages.append({"role": "user", "content": user_prompt})
 
     response = client_ai.chat.completions.create(
-        model="qwen2.5-72b-instruct", # 答题模型可以稍微聪明一点
+        model="qwen-plus", # 答题模型可以稍微聪明一点
         messages=messages,
     )
     return response.choices[0].message.content
 def generate_evaluation_dataset(chunks: List[str], num_cases=5) -> List[Dict]:
-    """模型二：出题模型 (qwen-plus)"""
+    """模型二：出题模型 (qwen2.5-72b-instruct)"""
     sample_text = "\n".join(random.sample(chunks, min(10, len(chunks))))
     prompt = f"""
     你是一个严谨的考试出题专家。请基于以下提供的文本，生成 {num_cases} 个具体的事实性问答对。
@@ -223,7 +223,7 @@ def generate_evaluation_dataset(chunks: List[str], num_cases=5) -> List[Dict]:
     """
     try:
         response = client_ai.chat.completions.create(
-            model="qwen-plus",
+            model="qwen2.5-72b-instruct",
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"}
         )
