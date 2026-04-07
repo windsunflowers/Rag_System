@@ -200,7 +200,7 @@ def rag_pipeline(query: str, history: List[Dict] = None) -> str:
     messages.append({"role": "user", "content": user_prompt})
 
     response = client_ai.chat.completions.create(
-        model="qwen-plus", # 答题模型可以稍微聪明一点
+        model="qwen2.5-72b-instruct", # 答题模型可以稍微聪明一点
         messages=messages,
     )
     return response.choices[0].message.content
