@@ -1,10 +1,27 @@
-# Python-generated files
+# 1. 环境变量与机密文件 (最重要，绝对不能上传！)
+.env
+*.env
+.env.*
+
+# 2. 针对 Streamlit Cloud 冲突的特定忽略 (强制云端只读 requirements.txt)
+pyproject.toml
+uv.lock
+
+# 3. 虚拟环境
+.venv/
+venv/
+env/
+
+# 4. Python 自动生成的缓存与构建文件
 __pycache__/
-*.py[oc]
+*.py[cod]
+*$py.class
 build/
 dist/
 wheels/
-*.egg-info
+*.egg-info/
+.pytest_cache/
 
-# Virtual environments
-.venv
+# 5. 操作系统自动生成的垃圾文件
+.DS_Store
+Thumbs.db

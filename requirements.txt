@@ -4,6 +4,8 @@ python-dotenv
 sentence-transformers
 chromadb
 torch
+torchvision
+protobuf<5.0.0
 pdfplumber
 python-docx
 Pillow
