@@ -16,7 +16,8 @@ import pdfplumber
 # 1. 页面与全局配置 (严格无 Emoji, 专业风格)
 # ==========================================
 st.set_page_config(page_title="智能文档解析与评测系统", layout="wide")
-# 注入自定义 CSS 以缩减页面顶部空白
+
+# 注入自定义 CSS 以缩减页面和侧边栏顶部空白
 st.markdown("""
     <style>
         /* 1. 调整右侧主界面顶部空白 */
@@ -27,7 +28,7 @@ st.markdown("""
         
         /* 2. 调整左侧边栏顶部空白 */
         [data-testid="stSidebarUserContent"] {
-            padding-top: 1rem; /* 这里的数值也可根据你的喜好改为 1rem 或更小 */
+            padding-top: 2rem; 
         }
     </style>
 """, unsafe_allow_html=True)
@@ -88,8 +89,8 @@ def extract_text_from_file(file_path: str, file_extension: str) -> str:
     elif file_extension in ['jpg', 'jpeg', 'png']:
         from PIL import Image
         import pytesseract
-
         
+        # 指定 Tesseract 的执行文件路径
         pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
         try:
             img = Image.open(file_path)
@@ -247,7 +248,7 @@ def evaluate_answer(query: str, generated_answer: str, ground_truth: str, judge_
     prompt = f"""
     你是一个客观且具备专业知识的阅卷专家。请根据【用户问题】和【标准答案】，对【模型生成的答案】进行评分(0-10分)。
 
-    🎯 评分核心原则（请严格遵守）：
+    评分核心原则（请严格遵守）：
     1. 【核心覆盖即满分】：只要模型答案完整包含了标准答案的核心事实，就应当给予 10 分。语言表述无需完全一致。
     2. 【鼓励合理补充】：如果模型答案在覆盖标准答案的基础上，提供了额外的、事实正确的补充信息（例如相关的测试工具、背景知识等），**绝对不能扣分**，应视为逻辑详实的好答案。
     3. 【扣分红线】：仅当模型答案发生以下情况时才扣分：
@@ -274,12 +275,12 @@ def evaluate_answer(query: str, generated_answer: str, ground_truth: str, judge_
 # ==========================================
 # 5. UI 界面层
 # ==========================================
-st.title("基于通义千问的RAG检索增强生成系统")
+st.title("基于通义千问的 RAG 检索增强生成系统")
 st.markdown("---")
 
 # 侧边栏：模型配置与文件解析
 with st.sidebar:
-    st.header("系统模型配置：")
+    st.header("系统模型配置")
     st.markdown("请选择相应模型：")
     
     # 用户自由选择模型，提供默认最佳实践的 index
@@ -288,7 +289,7 @@ with st.sidebar:
     selected_judge_model = st.selectbox("裁判模型 (智能评分)", AVAILABLE_MODELS, index=2)
     
     st.markdown("---")
-    st.header("文件解析：")
+    st.header("文件解析")
     st.markdown("支持格式：`.pdf`, `.docx`, `.jpg`, `.png`")
     
     uploaded_file = st.file_uploader("拖拽文件至此区域自动解析", type=["pdf", "docx", "jpg", "jpeg", "png"])
