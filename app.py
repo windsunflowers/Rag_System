@@ -313,16 +313,26 @@ with st.sidebar:
     st.header("文件解析")
     st.markdown("支持格式：`.pdf`, `.docx`, `.jpg`, `.png`")
     
-    uploaded_file = st.file_uploader("拖拽文件至此区域自动解析", type=["pdf", "docx", "jpg", "jpeg", "png"])
+    # 开启多文件支持：accept_multiple_files=True
+    uploaded_files = st.file_uploader("拖拽文件至此区域自动解析 (支持多文件)", type=["pdf", "docx", "jpg", "jpeg", "png"], accept_multiple_files=True)
     
-    if uploaded_file is not None:
-        file_hash = f"{uploaded_file.name}_{uploaded_file.size}"
+    if uploaded_files: # 如果上传了文件（列表不为空）
+        # 将所有文件的信息拼接成一个唯一的 Hash，用于判断用户是否增加/删除了文件
+        file_hash = "|".join([f"{f.name}_{f.size}" for f in uploaded_files])
+        
+        # 只要文件列表发生变动（新增或取消了某个文件），就重新构建知识库
         if st.session_state.get("current_file_hash") != file_hash:
-            with st.spinner("系统正在读取并向量化文档..."):
-                chunks = process_uploaded_file(uploaded_file)
-                if chunks:
-                    build_index(chunks)
-                    st.session_state['chunks'] = chunks
+            with st.spinner("系统正在读取并合并向量化文档..."):
+                all_chunks = []
+                for file in uploaded_files:
+                    # 循环解析每一个上传的文件
+                    chunks = process_uploaded_file(file)
+                    if chunks:
+                        all_chunks.extend(chunks) # 合并所有片段
+                
+                if all_chunks:
+                    build_index(all_chunks) # 一次性将所有文件的片段写入数据库
+                    st.session_state['chunks'] = all_chunks
                     st.session_state['current_file_hash'] = file_hash
                     st.session_state['messages'] = []
                     st.session_state.pop('test_cases', None)
@@ -330,11 +340,19 @@ with st.sidebar:
                     st.warning("未能在文档中提取到有效文本。")
                     
         if 'chunks' in st.session_state:
-            st.success("知识库已就绪")
-            st.info(f"当前文档: {uploaded_file.name}\n片段数量: {len(st.session_state['chunks'])}")
+            st.success("多文档知识库已就绪")
+            st.info(f"当前已加载文档数: {len(uploaded_files)} 个\n融合片段总数: {len(st.session_state['chunks'])}")
     else:
+        # 【关键修复】当用户点击 X 清空所有文件时，不仅要清理页面 Session，还要彻底清空底层向量数据库
         st.session_state.pop("current_file_hash", None)
         st.session_state.pop("chunks", None)
+        st.session_state.pop("test_cases", None)
+        st.session_state.pop("messages", None)
+        
+        # 提取当前数据库中残留的旧数据并强制删除
+        existing_ids = collection.get()["ids"]
+        if existing_ids:
+            collection.delete(ids=existing_ids)
 
 # 主界面：功能分签
 if 'chunks' in st.session_state and collection.count() > 0:
