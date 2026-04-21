@@ -73,6 +73,7 @@ def extract_text_from_file(file_path: str, file_extension: str) -> str:
         import io
         import base64
         from PIL import Image
+        import docx
 
         with pdfplumber.open(file_path) as pdf:
             for page_num, page in enumerate(pdf.pages):
@@ -151,6 +152,10 @@ def extract_text_from_file(file_path: str, file_extension: str) -> str:
                         print(f"提取第 {page_num+1} 页图片失败，跳过: {e}")
                         continue
 
+    elif file_extension == 'docx':
+        doc = docx.Document(file_path)
+        full_text = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
+
     elif file_extension in ['jpg', 'jpeg', 'png']:
         try:
             # 1. 使用 PIL 打开图片
@@ -206,6 +211,7 @@ def extract_text_from_file(file_path: str, file_extension: str) -> str:
         raise ValueError("不支持的文件格式")
         
     return full_text
+    
 def process_uploaded_file(uploaded_file) -> List[Dict]:
     file_extension = uploaded_file.name.split('.')[-1].lower()
     with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_extension}") as tmp:
@@ -263,7 +269,7 @@ def process_uploaded_file(uploaded_file) -> List[Dict]:
         parents.append({"context": context_tag, "text": "\n".join(current_parent_lines)})
 
 
-    # 3💉 终极绝杀：上下文注入法 (Contextual Injection)
+    # 终极绝杀：上下文注入法 (Contextual Injection)
 
     hierarchical_chunks = []
     window_size = 2  # 依然采用滑动窗口合并句子
@@ -399,6 +405,90 @@ def rag_pipeline(query: str, history: List[Dict] = None, answer_model: str = "qw
     )
     return response.choices[0].message.content, context_text
 
+def rag_pipeline_stream(query: str, history: List[Dict] = None, answer_model: str = "qwen-turbo"):
+    """支持 Stream 流式输出的 RAG 核心逻辑"""
+    search_query = query
+    
+    # ================= 1. 补充缺失的意图识别与检索逻辑 =================
+    if history and len(history) > 0:
+        recent_history = "\n".join([f"{msg['role']}: {msg['content']}" for msg in history[-4:]])
+        rewrite_prompt = f"""
+        你是一个意图识别专家。请结合以下历史对话，将用户的最新简短问题重写为一个完整、独立的问题。
+        如果用户的原问题已经很完整，或者与历史对话无关，请直接输出原问题。不要输出任何额外解释。
+        【历史对话】:\n{recent_history}\n【最新用户问题】: {query}\n重写后的独立问题：
+        """
+        try:
+            rewrite_response = client_ai.chat.completions.create(
+                model="qwen-turbo",
+                messages=[{"role": "user", "content": rewrite_prompt}]
+            )
+            search_query = rewrite_response.choices[0].message.content.strip()
+        except Exception:
+            pass
+
+    # 粗排：向量检索 Top-10
+    query_emb = embed_model.encode([search_query]).tolist()
+    results = collection.query(query_embeddings=query_emb, n_results=10)
+    
+    context_text = ""
+    if results["metadatas"] and results["metadatas"][0]:
+        retrieved_metadatas = results["metadatas"][0]
+        
+        # 父块去重
+        unique_parents = []
+        seen = set()
+        for meta in retrieved_metadatas:
+            parent_text = meta["parent"]
+            if parent_text not in seen:
+                seen.add(parent_text)
+                unique_parents.append(parent_text)
+                
+        # 精排
+        pairs = [[search_query, p] for p in unique_parents]
+        scores = rerank_model.predict(pairs)
+        ranked = sorted(zip(unique_parents, scores), key=lambda x: x[1], reverse=True)
+        
+        # 选取 Top 2
+        final_context = []
+        for doc, score in ranked[:2]:
+            if score > -5.0:
+                final_context.append(doc)
+                
+        if not final_context and ranked:
+            final_context.append(ranked[0][0])
+            
+        context_text = chr(10).join(final_context)
+
+    # ================= 2. 补充缺失的 Prompt 定义 =================
+    system_prompt = """你是一个智能文档助手。请遵循以下规则回答：
+    1. 【核心规则】：如果用户的问题是关于文档内容的，请务必严格且仅根据提供的【参考内容】进行回答。
+    2. 【历史对话】：如果用户询问的是你们之间的对话历史（例如“我上一个问题是什么”、“根据上文…”），请直接基于对话历史回答，此时无需受参考内容的限制。
+    3. 如果既无法在参考内容中找到答案，也无法在历史记录中找到答案，请诚实告知。"""
+    
+    user_prompt = f"参考内容：\n{context_text}\n\n当前问题：{query}"
+
+    # ================= 3. 拼装消息并请求流式接口 =================
+    messages = [{"role": "system", "content": system_prompt}]
+    if history:
+        messages.extend(history[-4:]) 
+    messages.append({"role": "user", "content": user_prompt})
+
+    # 开启流式请求
+    response = client_ai.chat.completions.create(
+        model=answer_model, 
+        messages=messages,
+        stream=True  # 关键点
+    )
+    
+    # 构建一个 Python 生成器 (Generator)
+    def stream_generator():
+        for chunk in response:
+            if chunk.choices and chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
+    
+    # 返回生成器和参考上下文
+    return stream_generator(), context_text
+    
 def generate_evaluation_dataset(chunks_data: List[Dict], num_cases: int = 5, gen_model: str = "qwen-plus") -> List[Dict]:
     """模块二：出题 (基于大父块出题)"""
     # 从字典列表中提取所有去重后的父块
@@ -569,17 +659,24 @@ if 'chunks' in st.session_state and collection.count() > 0:
                 st.markdown(message["content"])
 
         if prompt := st.chat_input("请输入您关于文档的问题"):
+            # 1. 显示用户输入
             st.session_state.messages.append({"role": "user", "content": prompt})
             with st.chat_message("user"):
                 st.markdown(prompt)
 
+            # 2. 生成流式回答
             with st.chat_message("assistant"):
-                with st.spinner("模型思考中..."):
-                    history_for_rag = st.session_state.messages[:-1] 
-                    # 解包两个返回值，在聊天界面我们只展示 answer，忽略 context
-                    response_ans, _ = rag_pipeline(prompt, history=history_for_rag, answer_model=selected_rag_model)
-                    st.markdown(response_ans)
-            st.session_state.messages.append({"role": "assistant", "content": response_ans})
+                history_for_rag = st.session_state.messages[:-1] 
+                
+                with st.spinner("正在检索知识库并思考..."):
+            # 1. 先获取生成器（会执行检索）
+                    stream_gen, _ = rag_pipeline_stream(prompt, history=history_for_rag, answer_model=selected_rag_model)
+            
+            # 2. 流式输出（spinner 会一直显示到输出结束）
+                    full_response = st.write_stream(stream_gen)
+
+    # 3. 存入历史
+            st.session_state.messages.append({"role": "assistant", "content": full_response})
 
     # ---------------- 第二部分：准确度测评 ----------------
     with tab2:
