@@ -14,6 +14,8 @@ import pdfplumber
 import base64
 import io
 from PIL import Image
+import jieba
+from rank_bm25 import BM25Okapi
 
 # 1. 页面与全局配置
 st.set_page_config(page_title="智能文档解析与评测系统", layout="wide")
@@ -318,6 +320,7 @@ def process_uploaded_file(uploaded_file) -> List[Dict]:
         print("-" * 50)
 
     return hierarchical_chunks
+
 def build_index(chunks_data: List[Dict]):
     existing_ids = collection.get()["ids"]
     if existing_ids:
@@ -333,9 +336,23 @@ def build_index(chunks_data: List[Dict]):
     # 存入数据库时，同时传入 metadatas
     collection.add(documents=child_texts, embeddings=embeddings, metadatas=metadatas, ids=ids)
 
+    # 【新增逻辑】：构建 BM25 倒排索引
+    global global_bm25, global_child_texts
+    global_child_texts = [item["child"] for item in chunks_data]
+    
+    # 对所有子块进行结巴分词
+    tokenized_corpus = [list(jieba.cut(text)) for text in global_child_texts]
+    global_bm25 = BM25Okapi(tokenized_corpus)
+
+    child_texts = [item["child"] for item in chunks_data]
+    st.session_state['global_child_texts'] = child_texts
+    
+    # 对所有子块进行结巴分词并构建 BM25
+    tokenized_corpus = [list(jieba.cut(text)) for text in child_texts]
+    st.session_state['global_bm25'] = BM25Okapi(tokenized_corpus)
 # 4. RAG 与 动态模型调度机制
 def rag_pipeline(query: str, history: List[Dict] = None, answer_model: str = "qwen-turbo") -> str:
-    """模块一：答题 (小块检索，大块喂入)"""
+    """模块一：答题 (混合检索，大块喂入)"""
     search_query = query
     if history and len(history) > 0:
         recent_history = "\n".join([f"{msg['role']}: {msg['content']}" for msg in history[-4:]])
@@ -353,46 +370,61 @@ def rag_pipeline(query: str, history: List[Dict] = None, answer_model: str = "qw
         except Exception:
             pass
 
-    # 1. 粗排：向量检索 Top-10 的“子块”
+    # ================= 1. 【路 A】：缺失的 ChromaDB 向量粗排 =================
     query_emb = embed_model.encode([search_query]).tolist()
     results = collection.query(query_embeddings=query_emb, n_results=10)
+    retrieved_metadatas = results["metadatas"][0] if results["metadatas"] and results["metadatas"][0] else []
     
-    # 注意这里：我们现在要取的是 metadatas，而不是 documents
-    if not results["metadatas"] or not results["metadatas"][0]:
-        return "知识库为空或未检索到相关内容。", ""
+    # ================= 2. 【路 B】：BM25 关键字粗排 =================
+    bm25_metadatas = []
+    if 'global_bm25' in st.session_state and 'global_child_texts' in st.session_state:
+        bm25_engine = st.session_state['global_bm25']
+        child_texts = st.session_state['global_child_texts']
         
-    retrieved_metadatas = results["metadatas"][0]
+        tokenized_query = list(jieba.cut(search_query))
+        # 获取 BM25 得分最高的 Top-10 子块的索引
+        top_n_indices = bm25_engine.get_top_n(tokenized_query, range(len(child_texts)), n=10)
+        
+        if 'chunks' in st.session_state:
+            chunks_data = st.session_state['chunks']
+            bm25_metadatas = [{"parent": chunks_data[i]["parent"]} for i in top_n_indices]
+            
+    # ================= 3. 【去重与合并】：将两路召回进行 Set Union =================
+    combined_metadatas = retrieved_metadatas + bm25_metadatas
     
-    # 2. 魔法时刻：从小块中提取关联的“大父块”，并去重！
     unique_parents = []
     seen = set()
-    for meta in retrieved_metadatas:
+    for meta in combined_metadatas:
         parent_text = meta["parent"]
         if parent_text not in seen:
             seen.add(parent_text)
             unique_parents.append(parent_text)
             
-    # 3. 精排：让重排序模型（CrossEncoder）去阅读这些去重后的大父块
-    pairs = [[search_query, p] for p in unique_parents]
-    scores = rerank_model.predict(pairs)
-    ranked = sorted(zip(unique_parents, scores), key=lambda x: x[1], reverse=True)
-    
-    # 4. 选取最相关的前 2 个大父块喂给千问大模型
-    final_context = []
-    for doc, score in ranked[:2]:
-        if score > -5.0: # 精排模型得分阈值
-            final_context.append(doc)
+    # ================= 4. 【精排】：让 CrossEncoder 阅读去重后的大父块 =================
+    final_context_text = ""
+    if unique_parents:
+        pairs = [[search_query, p] for p in unique_parents]
+        scores = rerank_model.predict(pairs)
+        ranked = sorted(zip(unique_parents, scores), key=lambda x: x[1], reverse=True)
+        
+        # 选取最相关的前 2 个大父块喂给千问大模型
+        final_context = []
+        for doc, score in ranked[:2]:
+            if score > -5.0: # 精排模型得分阈值
+                final_context.append(doc)
+                
+        if not final_context and ranked:
+            final_context.append(ranked[0][0])
             
-    if not final_context and ranked:
-        final_context.append(ranked[0][0])
+        final_context_text = chr(10).join(final_context)
     
+    # ================= 5. 【生成答案】 =================
     system_prompt = """你是一个智能文档助手。请遵循以下规则回答：
     1. 【核心规则】：如果用户的问题是关于文档内容的，请务必严格且仅根据提供的【参考内容】进行回答。
     2. 【历史对话】：如果用户询问的是你们之间的对话历史（例如“我上一个问题是什么”、“根据上文…”），请直接基于对话历史回答，此时无需受参考内容的限制。
     3. 如果既无法在参考内容中找到答案，也无法在历史记录中找到答案，请诚实告知。"""
     
-    context_text = chr(10).join(final_context)
-    user_prompt = f"参考内容：\n{context_text}\n\n当前问题：{query}"
+    user_prompt = f"参考内容：\n{final_context_text}\n\n当前问题：{query}"
     
     messages = [{"role": "system", "content": system_prompt}]
     if history:
@@ -403,13 +435,12 @@ def rag_pipeline(query: str, history: List[Dict] = None, answer_model: str = "qw
         model=answer_model, 
         messages=messages,
     )
-    return response.choices[0].message.content, context_text
-
+    return response.choices[0].message.content, final_context_text
 def rag_pipeline_stream(query: str, history: List[Dict] = None, answer_model: str = "qwen-turbo"):
-    """支持 Stream 流式输出的 RAG 核心逻辑"""
+    """支持 Stream 流式输出的 RAG 核心逻辑 (已修复变量缺失与无限嵌套 Bug)"""
     search_query = query
     
-    # ================= 1. 补充缺失的意图识别与检索逻辑 =================
+    # ================= 1. 意图识别重写 =================
     if history and len(history) > 0:
         recent_history = "\n".join([f"{msg['role']}: {msg['content']}" for msg in history[-4:]])
         rewrite_prompt = f"""
@@ -426,69 +457,79 @@ def rag_pipeline_stream(query: str, history: List[Dict] = None, answer_model: st
         except Exception:
             pass
 
-    # 粗排：向量检索 Top-10
+    # ================= 2. 【路 A】：ChromaDB 向量粗排 =================
     query_emb = embed_model.encode([search_query]).tolist()
     results = collection.query(query_embeddings=query_emb, n_results=10)
+    retrieved_metadatas = results["metadatas"][0] if results["metadatas"] and results["metadatas"][0] else []
     
-    context_text = ""
-    if results["metadatas"] and results["metadatas"][0]:
-        retrieved_metadatas = results["metadatas"][0]
+    # ================= 3. 【路 B】：BM25 关键字粗排 =================
+    bm25_metadatas = []
+    if 'global_bm25' in st.session_state and 'global_child_texts' in st.session_state:
+        import jieba
+        bm25_engine = st.session_state['global_bm25']
+        child_texts = st.session_state['global_child_texts']
         
-        # 父块去重
-        unique_parents = []
-        seen = set()
-        for meta in retrieved_metadatas:
-            parent_text = meta["parent"]
-            if parent_text not in seen:
-                seen.add(parent_text)
-                unique_parents.append(parent_text)
-                
-        # 精排
+        tokenized_query = list(jieba.cut(search_query))
+        top_n_indices = bm25_engine.get_top_n(tokenized_query, range(len(child_texts)), n=10)
+        
+        if 'chunks' in st.session_state:
+            chunks_data = st.session_state['chunks']
+            bm25_metadatas = [{"parent": chunks_data[i]["parent"]} for i in top_n_indices]
+
+    # ================= 4. 去重与合并 =================
+    combined_metadatas = retrieved_metadatas + bm25_metadatas
+    unique_parents = []
+    seen = set()
+    for meta in combined_metadatas:
+        parent_text = meta["parent"]
+        if parent_text not in seen:
+            seen.add(parent_text)
+            unique_parents.append(parent_text)
+
+    # ================= 5. CrossEncoder 精排 =================
+    final_context_text = ""
+    if unique_parents:
         pairs = [[search_query, p] for p in unique_parents]
         scores = rerank_model.predict(pairs)
         ranked = sorted(zip(unique_parents, scores), key=lambda x: x[1], reverse=True)
         
-        # 选取 Top 2
         final_context = []
         for doc, score in ranked[:2]:
-            if score > -5.0:
+            if score > -5.0: # 精排模型得分阈值
                 final_context.append(doc)
                 
         if not final_context and ranked:
             final_context.append(ranked[0][0])
             
-        context_text = chr(10).join(final_context)
+        final_context_text = chr(10).join(final_context)
 
-    # ================= 2. 补充缺失的 Prompt 定义 =================
+    # ================= 6. 拼装 Prompt =================
     system_prompt = """你是一个智能文档助手。请遵循以下规则回答：
     1. 【核心规则】：如果用户的问题是关于文档内容的，请务必严格且仅根据提供的【参考内容】进行回答。
     2. 【历史对话】：如果用户询问的是你们之间的对话历史（例如“我上一个问题是什么”、“根据上文…”），请直接基于对话历史回答，此时无需受参考内容的限制。
     3. 如果既无法在参考内容中找到答案，也无法在历史记录中找到答案，请诚实告知。"""
     
-    user_prompt = f"参考内容：\n{context_text}\n\n当前问题：{query}"
-
-    # ================= 3. 拼装消息并请求流式接口 =================
+    user_prompt = f"参考内容：\n{final_context_text}\n\n当前问题：{query}"
+    
     messages = [{"role": "system", "content": system_prompt}]
     if history:
         messages.extend(history[-4:]) 
     messages.append({"role": "user", "content": user_prompt})
 
-    # 开启流式请求
+    # ================= 7. 调用流式 API =================
     response = client_ai.chat.completions.create(
         model=answer_model, 
         messages=messages,
-        stream=True  # 关键点
+        stream=True  # 开启流式
     )
     
-    # 构建一个 Python 生成器 (Generator)
+    # ================= 8. 纯净的数据生成器 (内部严禁写 UI 代码) =================
     def stream_generator():
         for chunk in response:
             if chunk.choices and chunk.choices[0].delta.content:
                 yield chunk.choices[0].delta.content
     
-    # 返回生成器和参考上下文
-    return stream_generator(), context_text
-    
+    return stream_generator(), final_context_text
 def generate_evaluation_dataset(chunks_data: List[Dict], num_cases: int = 5, gen_model: str = "qwen-plus") -> List[Dict]:
     """模块二：出题 (基于大父块出题)"""
     # 从字典列表中提取所有去重后的父块
