@@ -16,6 +16,8 @@ import io
 from PIL import Image
 import jieba
 from rank_bm25 import BM25Okapi
+import concurrent.futures
+import time
 
 # 1. 页面与全局配置
 st.set_page_config(page_title="智能文档解析与评测系统", layout="wide")
@@ -623,7 +625,24 @@ def evaluate_answer(query: str, generated_answer: str, ground_truth: str, contex
             "context_recall": err_dict, 
             "context_precision": err_dict
         }
-
+def process_single_evaluation(case, rag_model, judge_model):
+    """多线程 Worker 函数：只负责网络请求和计算，绝对不包含 st.xxx 代码"""
+    q = case.get('query')
+    gt = case.get('ground_truth')
+    
+    # 1. 获取 RAG 答案和上下文
+    rag_ans, retrieved_ctx = rag_pipeline(q, answer_model=rag_model)
+    
+    # 2. 将上下文传给裁判进行多维打分
+    eval_result = evaluate_answer(q, rag_ans, gt, retrieved_ctx, judge_model=judge_model)
+    
+    # 返回组装好的数据结果
+    return {
+        "query": q,
+        "ground_truth": gt,
+        "rag_ans": rag_ans,
+        "eval_result": eval_result
+    }
 # 5. UI 界面层
 st.title("基于通义千问的 RAG 检索增强生成系统")
 st.markdown("---")
@@ -741,23 +760,70 @@ if 'chunks' in st.session_state and collection.count() > 0:
             st.markdown("#### 当前评测数据集")
             st.dataframe(st.session_state['test_cases'], use_container_width=True)
             
+            # 【核心优化】：多线程 RAGAS 评测执行逻辑
             if st.button("执行 RAGAS 标准评测", type="primary", use_container_width=True):
                 st.markdown("---")
-                # 初始化 RAGAS 4 个维度的总分
-                scores_total = {"fa": 0, "ar": 0, "cr": 0, "cp": 0}
-                progress_bar = st.progress(0)
                 
-                for i, case in enumerate(st.session_state['test_cases']):
-                    q = case.get('query')
-                    gt = case.get('ground_truth')
+                # 初始化总分记录
+                scores_total = {"fa": 0, "ar": 0, "cr": 0, "cp": 0}
+                total_cases = len(st.session_state['test_cases'])
+                
+                # UI 占位符
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                status_text.text(f"正在启动多线程并发测评 (共 {total_cases} 题)...")
+                
+                # 预先分配列表占位，保证渲染顺序严格对应测试集的 1 到 N 题
+                results_list = [None] * total_cases 
+                completed_count = 0
+                
+                # 启动多线程并发请求 (建议 max_workers=5 防大模型限流)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                    # 提交所有任务
+                    future_to_index = {
+                        executor.submit(
+                            process_single_evaluation, 
+                            case, 
+                            selected_rag_model, 
+                            selected_judge_model
+                        ): i for i, case in enumerate(st.session_state['test_cases'])
+                    }
                     
-                    # 获取答案和上下文
-                    rag_ans, retrieved_ctx = rag_pipeline(q, answer_model=selected_rag_model)
-                    # 将上下文传给裁判
-                    eval_result = evaluate_answer(q, rag_ans, gt, retrieved_ctx, judge_model=selected_judge_model)
+                    # 异步等待任务完成并收集
+                    for future in concurrent.futures.as_completed(future_to_index):
+                        i = future_to_index[future]
+                        try:
+                            result_data = future.result()
+                            results_list[i] = result_data  
+                        except Exception as e:
+                            st.error(f"测试集 {i+1} 测评发生异常: {e}")
+                            results_list[i] = {
+                                "query": st.session_state['test_cases'][i].get('query'),
+                                "ground_truth": st.session_state['test_cases'][i].get('ground_truth'),
+                                "rag_ans": "请求失败或超时",
+                                "eval_result": {}
+                            }
+                        
+                        # 更新进度条
+                        completed_count += 1
+                        progress_bar.progress(completed_count / total_cases)
+                        status_text.text(f"测评进度: {completed_count} / {total_cases} 完成")
+
+                # 【主线程 UI 渲染区】：所有数据并发请求完毕后，安全、顺畅地渲染界面
+                status_text.text("测评数据计算完毕，正在生成报告...")
+                time.sleep(0.5)
+                status_text.empty() 
+                
+                for i, res in enumerate(results_list):
+                    if not res: continue
                     
-                    # 解析 RAGAS 4 个维度的分数和理由 (带安全回退)
-                    default_eval = {"score": 0, "reason": "解析失败"}
+                    q = res["query"]
+                    gt = res["ground_truth"]
+                    rag_ans = res["rag_ans"]
+                    eval_result = res["eval_result"]
+                    
+                    # 解析 RAGAS 4 个维度的分数和理由
+                    default_eval = {"score": 0, "reason": "解析失败或未返回"}
                     fa = eval_result.get("faithfulness", default_eval)
                     ar = eval_result.get("answer_relevancy", default_eval)
                     cr = eval_result.get("context_recall", default_eval)
@@ -770,26 +836,22 @@ if 'chunks' in st.session_state and collection.count() > 0:
                     
                     with st.expander(f"测试集 {i+1}: {q}", expanded=False):
                         st.markdown(f"**【基准答案】** {gt}")
-                        st.markdown(f"**【模型输出】 ({selected_rag_model})** {rag_ans}")
+                        st.markdown(f"**【模型输出】** ({selected_rag_model}) {rag_ans}")
                         st.markdown("---")
                         
-                        # 展示 RAGAS 四大指标
                         sc1, sc2, sc3, sc4 = st.columns(4)
                         sc1.metric("忠实性", f"{fa.get('score', 0)}%")
                         sc2.metric("回答相关性", f"{ar.get('score', 0)}%")
                         sc3.metric("上下文召回率", f"{cr.get('score', 0)}%")
                         sc4.metric("上下文精确率", f"{cp.get('score', 0)}%")
                         
-                        st.markdown(f"> **裁判评语 ({selected_judge_model}):**\n"
-                                    f"> - 忠实性 (Faithfulness): {fa.get('reason')}\n"
-                                    f"> - 回答相关性 (Answer Relevancy): {ar.get('reason')}\n"
-                                    f"> - 上下文召回率 (Context Recall): {cr.get('reason')}\n"
-                                    f"> - 上下文精确率 (Context Precision): {cp.get('reason')}")
-                    
-                    progress_bar.progress((i + 1) / len(st.session_state['test_cases']))
-                    
-                # 计算平均分
-                total_cases = len(st.session_state['test_cases'])
+                        st.markdown(f"> 裁判评语 ({selected_judge_model}): \n"
+                                    f"> - 忠实性: {fa.get('reason')}\n"
+                                    f"> - 回答相关性: {ar.get('reason')}\n"
+                                    f"> - 上下文召回率: {cr.get('reason')}\n"
+                                    f"> - 上下文精确率: {cp.get('reason')}")
+
+                # 计算大盘平均分并渲染
                 avg_fa = scores_total["fa"] / total_cases
                 avg_ar = scores_total["ar"] / total_cases
                 avg_cr = scores_total["cr"] / total_cases
@@ -797,9 +859,9 @@ if 'chunks' in st.session_state and collection.count() > 0:
                 
                 st.markdown("### RAGAS 核心指标大盘")
                 col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-                col_m1.metric("忠实性\n(Faithfulness)", f"{avg_fa:.1f}%", help="模型是否产生幻觉？得分越高说明回答越贴近检索到的原文。")
-                col_m2.metric("回答相关性\n(Answer Relevancy)", f"{avg_ar:.1f}%", help="回答是否切题？得分越高说明废话越少，直击痛点。")
-                col_m3.metric("上下文召回率\n(Context Recall)", f"{avg_cr:.1f}%", help="检索系统是否漏掉了关键信息？得分越高说明找得越全。")
-                col_m4.metric("上下文精确率\n(Context Precision)", f"{avg_cp:.1f}%", help="检索到的内容是否全是干货？得分越高说明噪音/废话越少。")
+                col_m1.metric("忠实性\n(Faithfulness)", f"{avg_fa:.1f}%")
+                col_m2.metric("回答相关性\n(Answer Relevancy)", f"{avg_ar:.1f}%")
+                col_m3.metric("上下文召回率\n(Context Recall)", f"{avg_cr:.1f}%")
+                col_m4.metric("上下文精确率\n(Context Precision)", f"{avg_cp:.1f}%")
 else:
     st.info("请先在左侧区域上传并解析文档，系统将自动解锁问答与测评功能。")
