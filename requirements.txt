@@ -1,8 +1,10 @@
-streamlit
+﻿streamlit
 openai
 python-dotenv
 sentence-transformers
 chromadb
+jieba
+rank-bm25
 torch
 torchvision
 protobuf<5.0.0
