@@ -1,27 +1,44 @@
-# 1. 环境变量与机密文件 (最重要，绝对不能上传！)
+# 1. 环境变量与机密文件（最重要，绝对不能上传！）
 .env
 *.env
 .env.*
+!.env.example
 
-# 2. 针对 Streamlit Cloud 冲突的特定忽略 (强制云端只读 requirements.txt)
-pyproject.toml
-uv.lock
+# 2. 原始数据与大文件（不入库，请本地保留）
+medical.json
+chroma_db/
+cache/
 
-# 3. 虚拟环境
+# 3. 媒体与文档产物（截图、导出文件等）
+*.jpg
+*.jpeg
+*.png
+*.pdf
+*.docx
+*.doc
+
+# 4. 本地生成与运行产物
+.workbuddy/
 .venv/
 venv/
 env/
-
-# 4. Python 自动生成的缓存与构建文件
 __pycache__/
 *.py[cod]
 *$py.class
+.ipynb_checkpoints/
 build/
 dist/
 wheels/
 *.egg-info/
 .pytest_cache/
 
-# 5. 操作系统自动生成的垃圾文件
+# 5. 与本项目无关的文件
+confluence/
+
+# 6. 针对 Streamlit Cloud 冲突的特定忽略（强制云端只读 requirements.txt）
+pyproject.toml
+uv.lock
+
+# 7. 操作系统自动生成的垃圾文件
 .DS_Store
 Thumbs.db
