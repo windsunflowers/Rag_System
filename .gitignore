@@ -16,6 +16,8 @@ cache/
 *.pdf
 *.docx
 *.doc
+!image1.png
+!image2.png
 
 # 4. 本地生成与运行产物
 .workbuddy/
